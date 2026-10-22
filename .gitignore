@@ -1,0 +1,37 @@
+# --- Credentials ---
+secrets.h
+**/secrets.h
+*.secret
+*.secrets
+credentials.h
+!config/secrets.example.h
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# --- Arduino / ESP32 build output ---
+# build/ matches at any depth (e.g. firmware/VoiceConsistent/build/), which
+# covers exported .bin and .hex firmware images without ignoring them repo-wide.
+build/
+*.elf
+*.map
+*.o
+*.a
+*.d
+
+# PlatformIO (in case it is used later)
+.pio/
+
+# --- Editor / OS ---
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*~
+
+# --- Logs and temporary files ---
+*.log
+*.tmp
+tmp/
