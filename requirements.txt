@@ -1,0 +1,5 @@
+# Backend (server.py). Requires Python 3.10+ (google-genai's minimum).
+google-genai>=2.33.0
+fastapi>=0.115
+# [standard] includes the websockets package that uvicorn needs for /ws.
+uvicorn[standard]>=0.30

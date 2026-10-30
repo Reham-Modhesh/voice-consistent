@@ -24,6 +24,15 @@ build/
 # PlatformIO (in case it is used later)
 .pio/
 
+# --- Python (server.py) ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local test recordings (tests/gemini/ws_client_test.py input/output)
+tests/**/*.wav
+
 # --- Editor / OS ---
 .DS_Store
 .vscode/*
