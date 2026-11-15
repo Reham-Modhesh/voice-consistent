@@ -1,135 +1,121 @@
 # Voice Consistent
 
-Voice Consistent is a stationary voice assistant built around a classic ESP32. It holds a real-time spoken conversation through the Gemini Live API: the ESP32 streams microphone audio over a WebSocket to a small Python bridge on your computer, the bridge relays it to a Gemini Live session, and Gemini's spoken reply streams back and plays through the speaker as it arrives.
+Voice Consistent is a stationary, interactive voice AI assistant built around a classic ESP32. It holds a real-time spoken conversation in Saudi Arabic through the Gemini Live API while displaying live animated facial expressions on an I2C OLED screen.
+
+The ESP32 streams microphone audio with real-time DSP filtering over a WebSocket to a Python FastAPI bridge on your computer, which relays it to a Gemini Live session and streams spoken audio replies back to the speaker.
 
 The device is stationary. It has no vehicle, motor-control or movement functionality, and the bridge rejects any movement-style function call.
 
-> **Status:** The Gemini Live firmware and bridge are written. The firmware compiles for an ESP32 Dev Module (core 3.3.12), and the bridge's protocol logic passes tests against a simulated Gemini session. **Nothing has been tested with real hardware or a real Gemini Live session yet.** Follow the [staged test plan](tests/README.md).
+> **Status:** Tested and working on real hardware (`FW_VERSION: live-0.3-dsp-stable`). Features real-time audio streaming, Adaptive Gain Control (AGC), DC-blocking filtering, and live OLED facial feedback.
 
 ## Goals
 
-- Hold a natural, low-latency spoken conversation, including follow-up questions.
-- Keep the hardware small and inexpensive, using common I2S audio modules.
-- Keep the API key off the device and out of source control.
-- Validate each part (microphone, speaker, network, AI) separately before combining them.
+- Hold a natural, low-latency spoken conversation in Saudi Arabic, including follow-up questions.
+- Provide clear visual feedback (connecting, idle, listening, thinking, speaking) via a 0.96" OLED display.
+- Keep the hardware compact and inexpensive using common I2S audio modules.
+- Keep the Gemini API key off the ESP32 and out of source control.
 
 ## Features
 
-- Continuous microphone streaming (16 kHz, 16-bit, mono) from an INMP441 over a persistent WebSocket.
-- One Gemini Live session per device connection, with native audio output and instructions to speak Saudi Arabic.
-- Streamed reply audio (24 kHz, 16-bit, mono) played through a MAX98357A as it arrives, with a short jitter buffer.
-- Conversation context kept within a session, including across Gemini's ~10 minute connection limit (session resumption) and beyond 15 minutes (context window compression).
-- Interruption handling: when Gemini reports an interruption, queued audio is discarded on both the bridge and the ESP32.
-- Automatic reconnection of Wi-Fi, the device WebSocket and the Gemini session.
+- **Real-Time Audio & DSP (`live-0.3-dsp-stable`):** Continuous microphone streaming (16 kHz, 16-bit, mono) from an INMP441 with a high-pass DC-blocking filter and Adaptive Gain Control (AGC).
+- **Live Visual Facial UI:** An SSD1306 I2C OLED display renders dynamic facial states synced with the conversation (`STATE_CONNECTING`, `STATE_IDLE`, `STATE_LISTENING`, `STATE_THINKING`, `STATE_SPEAKING`).
+- **Gemini Live Integration:** One Gemini Live session per device connection with native audio output, session resumption (~10 min limit), and context window compression (>15 min).
+- **Smooth Playback & Interruption Handling:** Streamed reply audio (24 kHz, 16-bit, mono) played through a MAX98357A with a jitter prebuffer. Queued audio is flushed immediately upon interruption.
+- **Auto-Recovery & Telemetry:** Automatic reconnection for Wi-Fi, WebSocket, and Gemini sessions, plus 1-second serial audio diagnostics (`RMS`, `peak`, `gain`, buffer drops).
 
-## Hardware
+## Hardware & Wiring (Pinout)
 
-| Component | Purpose |
-|---|---|
-| ESP32 Dev Module (classic ESP32, no PSRAM required) | Main controller, Wi-Fi |
-| INMP441 I2S MEMS microphone | Voice input (I2S port 0) |
-| MAX98357A I2S class-D amplifier | Audio output (I2S port 1) |
-| 3W, 4Ω speaker | Sound output |
-| Suitable power supply | Powers the board and amplifier |
-| Computer on the same network | Runs `server.py` |
-
-See [docs/wiring.md](docs/wiring.md) for the wiring used by the firmware.
+| Component | Purpose | ESP32 Pin |
+|---|---|---|
+| **ESP32 Dev Module** | Main controller & Wi-Fi (no PSRAM required) | — |
+| **INMP441** (I2S Mic) | Voice input (`I2S_NUM_0`, Left channel) | `WS` → **GPIO 25**<br>`SD` → **GPIO 32**<br>`SCK` → **GPIO 33**<br>`L/R` → **GND**<br>`VDD` → **3.3V** |
+| **MAX98357A** (I2S Amp) | Audio output (`I2S_NUM_1`) | `LRC` (WS) → **GPIO 26**<br>`BCLK` → **GPIO 27**<br>`DIN` → **GPIO 14**<br>`VIN` → **5V (VIN)** |
+| **SSD1306 OLED** (128×64) | Interactive facial expressions (`0x3C`) | `SDA` → **GPIO 18**<br>`SCL` → **GPIO 19**<br>`VCC` → **3.3V** |
+| **3W, 4Ω Speaker** | Sound output | Connected to `MAX98357A` (+/-) |
+| **Computer** | Runs `server.py` on the same 2.4 GHz network | — |
 
 ## Architecture
 
 ```text
-INMP441 ─I2S─▶ ESP32 ══ WebSocket /ws ══▶ server.py ══ Gemini Live (WSS) ══▶ gemini-3.8-live
-                 ▲      PCM 16 kHz up        │  ▲
-MAX98357A ◀─I2S──┘      PCM 24 kHz down ◀════┘  └══ streamed audio replies
+INMP441 ──I2S──▶ [ESP32 + FreeRTOS DSP] ══ WebSocket /ws ══▶ server.py ══ Gemini Live (WSS)
+SSD1306 ◀─I2C──┤   (Mic & Playback Tasks)   PCM 16 kHz up       │  ▲
+MAX98357A ◀I2S─┘                            PCM 24 kHz down ◀═══╝  └══ Streamed Audio Replies
 ```
 
-The Gemini API key stays on the computer running `server.py`. The exact wire protocol is documented at the top of [server.py](server.py), and the design is in [docs/architecture.md](docs/architecture.md).
+The Gemini API key stays on the computer running `server.py`. See [docs/architecture.md](docs/architecture.md) for full protocol details.
 
 ## Repository Layout
 
 ```text
-firmware/VoiceConsistent/   Main Arduino sketch (VoiceConsistent.ino)
+firmware/VoiceConsistent/   Main Arduino sketch (VoiceConsistent.ino - v0.3-dsp-stable)
 server.py                   Gemini Live WebSocket bridge (FastAPI)
 requirements.txt            Python dependencies for server.py
 .env.example                Template for GEMINI_API_KEY
-config/                     Credential header template (not yet used by the sketch)
-tests/                      Staged test plan and a PC-side WebSocket test client
-docs/                       Architecture and wiring documentation
+config/                     Credential header template
+tests/                      Staged test plan and PC-side WebSocket test client
+docs/                       Architecture and detailed wiring documentation
 ```
 
 ## Prerequisites
 
 **Backend**
-- Python **3.10 or newer** (required by `google-genai`). macOS's built-in Python 3.9 is too old; install a newer one, for example from python.org or with Homebrew.
+- Python **3.10 or newer** (required by `google-genai`).
 - A Google Gemini API key with access to the Live API model (`gemini-3.8-live` by default).
 
-**Firmware**
-- Arduino IDE 2.x or Arduino CLI.
-- Board package **esp32 by Espressif, version 3.x** (developed against 3.3.12).
-- Library **WebSockets by Markus Sattler** (links2004), version 2.7.x, from the Library Manager.
-- A 2.4 GHz Wi-Fi network shared by the ESP32 and the computer.
+**Firmware (Arduino IDE 2.x)**
+- Board package: **esp32 by Espressif, version 3.x** (tested on `3.3.12`).
+- Required Libraries (install via Arduino Library Manager):
+  1. **WebSockets** by Markus Sattler (`links2004`, version `2.7.x`)
+  2. **Adafruit GFX Library** by Adafruit
+  3. **Adafruit SSD1306** by Adafruit
+- A shared **2.4 GHz** Wi-Fi network (or mobile hotspot) for the ESP32 and computer.
 
 ## Setup
 
-### Backend (`server.py`)
+### 1. Backend (`server.py`)
 
-1. Create a virtual environment with Python 3.10+ and install the dependencies:
+1. Create a virtual environment and install dependencies:
    ```bash
-   python3.12 -m venv .venv
+   python3 -m venv .venv
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
-2. Provide your API key through the environment, either directly:
+2. Configure your API key via `.env` or environment variable:
    ```bash
-   export GEMINI_API_KEY="your-key"
-   ```
-   or from a local `.env` file:
-   ```bash
-   cp .env.example .env    # then edit .env
+   cp .env.example .env    # Add your GEMINI_API_KEY inside .env
    set -a; source .env; set +a
    ```
-3. Start the bridge from the repository root:
+3. Start the FastAPI bridge from the repository root:
    ```bash
    python3 -m uvicorn server:app --host 0.0.0.0 --port 8000
    ```
-4. Check `http://localhost:8000/`. It should report `"api_key_configured": true`.
-5. Find your computer's LAN IP address (for example `192.168.1.20`). macOS may ask whether to allow incoming connections for Python; allow it.
+4. Verify `http://localhost:8000/` returns `"api_key_configured": true`, and note your computer's local LAN IP address (e.g., `192.168.100.9`).
 
-Optional environment variables: `GEMINI_LIVE_MODEL` (default `gemini-3.8-live`) and `GEMINI_VOICE` (default `Kore`).
+### 2. Firmware (`VoiceConsistent.ino`)
 
-### Firmware
-
-1. Install the **WebSockets** library (Markus Sattler) from the Arduino Library Manager.
+1. Install the three required libraries listed in Prerequisites.
 2. Open `firmware/VoiceConsistent/VoiceConsistent.ino`.
-3. Edit `WIFI_SSID`, `WIFI_PASSWORD` and `SERVER_HOST` at the top of the sketch. **Do not commit these local edits** (see Security).
-4. Select **ESP32 Dev Module** and the correct serial port, then upload.
-5. Open the Serial Monitor at 115200 baud. When it prints `Gemini session ready. Start talking.`, speak normally.
+3. Update `WIFI_SSID`, `WIFI_PASSWORD`, and `SERVER_HOST` (your computer's LAN IP) at the top of the file. **Do not commit real credentials.**
+4. Select **ESP32 Dev Module** and the corresponding USB serial port, then click **Upload**.
+5. Open the Serial Monitor at **115200 baud**. Once connected, the OLED face transitions from `Connecting...` to idle/listening, and the monitor prints `Gemini session ready. Start talking.`
 
 ## Security
 
-- Never commit real Wi-Fi credentials or API keys.
-- The Gemini API key is read only from the `GEMINI_API_KEY` environment variable and is never logged. Keep it in your shell or in `.env`, which is listed in `.gitignore`. Only `.env.example` is meant to be committed.
-- The sketch holds Wi-Fi placeholders in the source file itself. After filling in real values, check `git diff` before committing and do not commit them.
-- If a key is ever committed or shared by mistake, revoke it and create a new one right away. Removing it from a later commit is not enough.
-- The bridge listens on your local network over plain `ws://` with no authentication, and anyone who can reach it can use your Gemini quota. Run it only on a trusted network.
-- The bridge logs transcripts of both sides of the conversation to its console.
+- **Never commit real Wi-Fi credentials or API keys.** Always replace credentials with placeholders before running `git push`.
+- `GEMINI_API_KEY` is loaded strictly from environment variables / `.env` (ignored by `.gitignore`).
+- The local WebSocket bridge (`ws://`) runs unauthenticated on your LAN; run it only on trusted networks.
 
-## Limitations
+## Limitations & Notes
 
-- **Echo / barge-in:** the speaker is close to the microphone and there is no echo cancellation. By default (`ALLOW_BARGE_IN 0`) the microphone is muted while a reply plays and for 300 ms after, so you cannot interrupt Gemini by voice. Setting it to `1` enables voice interruption, but the speaker's own sound may then interrupt replies.
-- **RAM (classic ESP32, no PSRAM):** the playback buffer is 32 KB (about 0.68 s). The bridge therefore paces reply audio to stay at most 0.35 s ahead of playback instead of sending it as fast as Gemini produces it.
-- **Latency:** a 150 ms prebuffer plus about 170 ms of I2S DMA buffering is added before replies are heard, on top of network and Gemini latency.
-- **I2S driver:** the firmware uses the legacy `driver/i2s.h` API, which is deprecated in ESP32 core 3.x and prints compile warnings. It must not be combined with the `ESP_I2S` library in the same sketch.
-- **Bandwidth:** about 32 KB/s up and 48 KB/s down. Weak Wi-Fi will cause dropped mic audio or playback gaps; the firmware prints counters for both every 15 seconds.
-- **Model availability:** `gemini-3.8-live` is the model named in the current Live API guide, but availability depends on your API key. Set `GEMINI_LIVE_MODEL` if you need another model.
-- **Trigger:** there is no wake word or button; the microphone streams whenever the device is connected and not playing.
+- **Echo Suppression:** Without hardware acoustic echo cancellation, `ALLOW_BARGE_IN` is set to `0` by default. The microphone automatically mutes during speaker playback and for 300 ms afterward to prevent self-triggering.
+- **RAM & Prebuffering:** Classic ESP32 boards without PSRAM use a 32 KB playback ring buffer (~0.68 s) with a 7,200-byte prebuffer (~150 ms) to prevent audio underruns over Wi-Fi.
+- **I2S Legacy Driver:** Uses `driver/i2s.h` for dual-port I2S stability (`I2S_NUM_0` for Mic, `I2S_NUM_1` for Speaker). Compile-time deprecation warnings on ESP32 core 3.x are expected and safe to ignore.
 
 ## Current Status
 
-| Area | Status |
+| Component | Status |
 |---|---|
-| Firmware (streaming mic, streaming playback, reconnection) | Written; compiles for ESP32 Dev Module with core 3.3.12; not tested on hardware |
-| Bridge (`server.py`) | Written; protocol logic passes tests against a simulated Gemini session; not tested against real Gemini Live |
-| Wiring | Unchanged from the previous firmware; microphone pins from an earlier working test |
-| Speech understanding and reply (Gemini Live native audio) | Written; not tested |
-| Tests | Staged plan and PC-side test client written; not yet run |
+| **Firmware (`live-0.3-dsp-stable`)** | Tested & verified on hardware (FreeRTOS dual-task mic/playback + AGC/DC DSP) |
+| **OLED Facial UI (`SSD1306`)** | Tested & working (dynamic eye/mouth states on I2C pins 18/19) |
+| **Bridge (`server.py`)** | Tested & working with Gemini Live API |
+| **Audio Pipeline (INMP441 + MAX98357A)** | Tuned & verified (16 kHz capture / 24 kHz playback) |
