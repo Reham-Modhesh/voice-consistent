@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <math.h>
 #include <WebSocketsClient.h>   // "WebSockets" library by Markus Sattler (links2004), 2.7.x
 #include <driver/i2s.h>         // legacy I2S driver
 #include <freertos/stream_buffer.h>
@@ -10,21 +11,21 @@
 //  ESP32 + INMP441 + MAX98357A + I2C OLED + Gemini Live
 // ============================================================
 
-#define FW_VERSION "live-0.2"
+#define FW_VERSION "live-0.3-dsp-stable"
 
 // ---- OLED Display Config ----
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
-#define SCREEN_ADDRESS 0x3C  // العنوان الافتراضي للشاشة
+#define SCREEN_ADDRESS 0x3C
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ---- Wi-Fi Details ----
-const char* WIFI_SSID     = "Saeed707";
-const char* WIFI_PASSWORD = "12341234";
+const char* WIFI_SSID     = "Abu Mohammed4G";
+const char* WIFI_PASSWORD = "ali203307";
 
 // ---- FastAPI Server Address ----
-const char* SERVER_HOST   = "172.20.10.2";
+const char* SERVER_HOST   = "192.168.100.9";
 const uint16_t SERVER_PORT = 8000;
 const char* SERVER_PATH   = "/ws";
 
@@ -42,12 +43,27 @@ const char* SERVER_PATH   = "/ws";
 #define SPK_BCLK_PIN     27  
 #define SPK_DIN_PIN      14  
 
+#define MIC_SLOT_INDEX 0 
+#define MIC_WORD_SHIFT 16 
+static const float MIC_BASE_GAIN = 3.0f;
+static const float MIC_MAX_GAIN = 8.0f;
+bool oledReady = false;
+
+struct AudioStats {
+  float rms, peak, dc, gain, slot0, slot1;
+  uint32_t samples, clipped, readErrors;
+};
+AudioStats audioStats = {};
+portMUX_TYPE statsMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t micSendFailures = 0;
+volatile uint32_t spkWriteErrors = 0;
+
 // ---- Audio settings ----
 static const uint32_t MIC_SAMPLE_RATE = 16000;
 static const uint32_t SPK_SAMPLE_RATE = 24000;
-static const int I2S_BUFFER_LEN = 512;
+static const int I2S_BUFFER_LEN = 256;               
 static const size_t MIC_FRAME_BYTES = 1280;          
-static const size_t MIC_BUFFER_BYTES = 8192;         
+static const size_t MIC_BUFFER_BYTES = 16384;        
 static const size_t SPK_BUFFER_BYTES = 32768;        
 static const size_t SPK_PREBUFFER_BYTES = 7200;      
 static const uint32_t MIC_MUTE_HOLD_MS = 300;
@@ -74,6 +90,7 @@ volatile SystemState currentState = STATE_INIT;
 
 // ---- Display Functions ----
 void drawFace(SystemState state) {
+  if (!oledReady) return;
   display.clearDisplay();
   
   switch(state) {
@@ -86,28 +103,24 @@ void drawFace(SystemState state) {
       break;
 
     case STATE_IDLE:
-      // عينان عاديتان للانتظار
       display.fillCircle(40, 25, 10, SSD1306_WHITE);
       display.fillCircle(88, 25, 10, SSD1306_WHITE);
       display.drawLine(50, 48, 78, 48, SSD1306_WHITE);
       break;
 
     case STATE_LISTENING:
-      // عينان مفتوحتان للاستماع
       display.fillCircle(40, 22, 12, SSD1306_WHITE);
       display.fillCircle(88, 22, 12, SSD1306_WHITE);
       display.drawCircle(64, 48, 6, SSD1306_WHITE);
       break;
 
     case STATE_THINKING:
-      // عينان تتطلعان للأعلى
       display.fillCircle(40, 18, 9, SSD1306_WHITE);
       display.fillCircle(88, 18, 9, SSD1306_WHITE);
       display.drawLine(55, 48, 73, 48, SSD1306_WHITE);
       break;
 
     case STATE_SPEAKING: {
-      // عينان سعيدتان وفم يتحرك مع الكلام
       display.fillTriangle(30, 28, 40, 18, 50, 28, SSD1306_WHITE);
       display.fillTriangle(78, 28, 88, 18, 98, 28, SSD1306_WHITE);
       static bool mouthOpen = false;
@@ -128,7 +141,7 @@ bool initMicrophone() {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = (int)MIC_SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = (i2s_comm_format_t)I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 4,
@@ -136,13 +149,13 @@ bool initMicrophone() {
     .use_apll = false
   };
 
-  i2s_pin_config_t micPins = {
-    .mck_io_num = I2S_PIN_NO_CHANGE,
-    .bck_io_num = MIC_SCK_PIN,
-    .ws_io_num = MIC_WS_PIN,
-    .data_out_num = I2S_PIN_NO_CHANGE,
-    .data_in_num = MIC_SD_PIN
-  };
+  i2s_pin_config_t micPins;
+  memset(&micPins, 0, sizeof(micPins));
+  micPins.bck_io_num = MIC_SCK_PIN;
+  micPins.ws_io_num = MIC_WS_PIN;
+  micPins.data_out_num = -1;
+  micPins.data_in_num = MIC_SD_PIN;
+  micPins.mck_io_num = -1;
 
   esp_err_t err = i2s_driver_install(MIC_I2S_PORT, &micConfig, 0, NULL);
   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return false;
@@ -167,13 +180,13 @@ bool initSpeaker() {
     .tx_desc_auto_clear = true
   };
 
-  i2s_pin_config_t speakerPins = {
-    .mck_io_num = I2S_PIN_NO_CHANGE,
-    .bck_io_num = SPK_BCLK_PIN,
-    .ws_io_num = SPK_WS_PIN,
-    .data_out_num = SPK_DIN_PIN,
-    .data_in_num = I2S_PIN_NO_CHANGE
-  };
+  i2s_pin_config_t speakerPins;
+  memset(&speakerPins, 0, sizeof(speakerPins));
+  speakerPins.bck_io_num = SPK_BCLK_PIN;
+  speakerPins.ws_io_num = SPK_WS_PIN;
+  speakerPins.data_out_num = SPK_DIN_PIN;
+  speakerPins.data_in_num = -1;
+  speakerPins.mck_io_num = -1;
 
   esp_err_t err = i2s_driver_install(SPEAKER_I2S_PORT, &speakerConfig, 0, NULL);
   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return false;
@@ -184,21 +197,83 @@ bool initSpeaker() {
   return true;
 }
 
+size_t sendAligned(StreamBufferHandle_t stream, const void* data, size_t bytes) {
+  size_t room = xStreamBufferSpacesAvailable(stream) & ~(size_t)1;
+  size_t n = bytes < room ? bytes : room;
+  return n ? xStreamBufferSend(stream, data, n, 0) : 0;
+}
+
 void micTask(void* arg) {
-  static int32_t rawSamples[256];
-  static int16_t pcm[256];
+  static int32_t raw[256]; 
+  static float filtered[128];
+  static int16_t pcm[128];
+  float previousInput = 0, previousOutput = 0, gain = MIC_BASE_GAIN;
+  double energy = 0, slotEnergy[2] = {0, 0}, mean = 0;
+  float peakWindow = 0;
+  uint32_t samples = 0, clipped = 0, errors = 0;
+  uint32_t lastReport = millis();
   for (;;) {
     size_t bytesRead = 0;
-    esp_err_t err = i2s_read(MIC_I2S_PORT, rawSamples, sizeof(rawSamples), &bytesRead, portMAX_DELAY);
-    if (err != ESP_OK || bytesRead == 0) continue;
-
-    size_t count = bytesRead / sizeof(int32_t);
-    for (size_t i = 0; i < count; i++) {
-      pcm[i] = (int16_t)(rawSamples[i] >> 15); // معالجة الصوت والـ Gain
+    esp_err_t err = i2s_read(MIC_I2S_PORT, raw, sizeof(raw), &bytesRead, pdMS_TO_TICKS(50));
+    if (err != ESP_OK || !bytesRead || bytesRead % 8) {
+      ++errors;
+      vTaskDelay(1);
+      continue;
     }
+    size_t count = bytesRead / 8;
+    float blockPeak = 0;
+    double blockEnergy = 0;
+    for (size_t i = 0; i < count; ++i) {
+      float left = (float)(raw[2*i] >> MIC_WORD_SHIFT);
+      float right = (float)(raw[2*i+1] >> MIC_WORD_SHIFT);
+      slotEnergy[0] += left * left;
+      slotEnergy[1] += right * right;
+      float x = MIC_SLOT_INDEX == 0 ? left : right;
+      
+      float y = x - previousInput + 0.9844f * previousOutput;
+      previousInput = x;
+      previousOutput = y;
+      filtered[i] = y;
+      blockEnergy += y*y;
+      blockPeak = fmaxf(blockPeak, fabsf(y));
+      mean += x;
+    }
+    float rms = sqrtf((float)(blockEnergy / count));
+    float desired = MIC_BASE_GAIN;
+    if (rms > 80.0f) desired = fminf(MIC_MAX_GAIN, 2500.0f / rms);
+    if (desired < 1.0f) desired = 1.0f;
+    if (blockPeak > 0) desired = fminf(desired, 28000.0f / blockPeak);
+    float startGain = gain;
+    gain += (desired < gain ? 0.65f : 0.015f) * (desired - gain);
+    for (size_t i = 0; i < count; ++i) {
+      float g = startGain + (gain-startGain) * (i+1) / count;
+      if (blockPeak > 0) g = fminf(g, 30000.0f / blockPeak);
+      float y = filtered[i] * g;
+      if (y > 32767 || y < -32768) ++clipped;
+      y = fmaxf(-32768, fminf(32767, y));
+      pcm[i] = (int16_t)lrintf(y);
+      energy += y*y;
+      peakWindow = fmaxf(peakWindow, fabsf(y));
+    }
+    samples += count;
     size_t bytes = count * sizeof(int16_t);
-    size_t queued = xStreamBufferSend(micStream, pcm, bytes, 0);
-    if (queued < bytes) micDroppedBytes += bytes - queued;
+    size_t queued = sendAligned(micStream, pcm, bytes);
+    if (queued < bytes) micDroppedBytes += (bytes - queued);
+
+    if (millis() - lastReport >= 1000) {
+      AudioStats snapshot = {sqrtf((float)(energy/samples)), peakWindow,
+        (float)(mean/samples), gain,
+        sqrtf((float)(slotEnergy[0]/samples)),
+        sqrtf((float)(slotEnergy[1]/samples)), samples, clipped, errors};
+      portENTER_CRITICAL(&statsMux);
+      audioStats = snapshot;
+      portEXIT_CRITICAL(&statsMux);
+      energy = mean = 0;
+      slotEnergy[0] = slotEnergy[1] = 0;
+      samples = clipped = errors = 0;
+      peakWindow = 0;
+      lastReport = millis();
+    }
   }
 }
 
@@ -230,12 +305,17 @@ void playbackTask(void* arg) {
     if (got == 0) {
       playing = false;
       speakerActive = false;
-      turnEnded = false;
       continue;
     }
 
     size_t written = 0;
-    i2s_write(SPEAKER_I2S_PORT, buffer, got, &written, portMAX_DELAY);
+    while (written < got && !flushPlayback) {
+      size_t part = 0;
+      esp_err_t err = i2s_write(SPEAKER_I2S_PORT, buffer + written,
+                              got-written, &part, pdMS_TO_TICKS(100));
+      written += part;
+      if (err != ESP_OK || part == 0) { ++spkWriteErrors; break; }
+    }
     lastSpeakerAudioMs = millis();
   }
 }
@@ -274,7 +354,7 @@ void handleControlMessage(const char* json) {
   if (strcmp(type, "ready") == 0) {
     serverReady = true;
     currentState = STATE_IDLE;
-    Serial.println("Gemini session ready. Start talking.");
+    Serial.println("\nGemini session ready. Start talking.");
   } else if (strcmp(type, "reconnecting") == 0) {
     serverReady = false;
     currentState = STATE_CONNECTING;
@@ -299,13 +379,19 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       flushPlayback = true;
       currentState = STATE_CONNECTING;
       break;
-    case WStype_TEXT:
-      handleControlMessage((const char*)payload);
+    case WStype_TEXT: {
+      if (length > 1024) break;
+      String message;
+      message.reserve(length + 1);
+      message.concat((const char*)payload, length);
+      handleControlMessage(message.c_str());
       break;
+    }
     case WStype_BIN: {
-      if (length < 3 || payload[0] != playEpoch) break;
+      if (length < 3 || payload[0] != playEpoch || flushPlayback) break;
+      turnEnded = false;
       size_t pcmBytes = (length - 1) & ~(size_t)1;
-      size_t queued = xStreamBufferSend(spkStream, payload + 1, pcmBytes, 0);
+      size_t queued = sendAligned(spkStream, payload + 1, pcmBytes);
       if (queued < pcmBytes) spkOverflowBytes += pcmBytes - queued;
       break;
     }
@@ -316,9 +402,7 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 
 void maintainWiFi() {
   static uint32_t lastAttempt = 0;
-  bool connected = (WiFi.status() == WL_CONNECTED);
-
-  if (!connected && millis() - lastAttempt > WIFI_RETRY_MS) {
+  if (WiFi.status() != WL_CONNECTED && millis() - lastAttempt > WIFI_RETRY_MS) {
     lastAttempt = millis();
     WiFi.disconnect();
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -327,58 +411,99 @@ void maintainWiFi() {
 
 void pumpMicrophone() {
   static uint8_t frame[MIC_FRAME_BYTES];
-  while (xStreamBufferBytesAvailable(micStream) >= MIC_FRAME_BYTES) {
+  while (xStreamBufferBytesAvailable(micStream) >= 4 * MIC_FRAME_BYTES) {
     xStreamBufferReceive(micStream, frame, MIC_FRAME_BYTES, 0);
-    if (serverReady && !micMuted()) {
-      webSocket.sendBIN(frame, MIC_FRAME_BYTES);
+  }
+  if (xStreamBufferBytesAvailable(micStream) >= MIC_FRAME_BYTES) {
+    size_t got = xStreamBufferReceive(micStream, frame, MIC_FRAME_BYTES, 0);
+    if (got == MIC_FRAME_BYTES && serverReady && !micMuted()) {
+      if (!webSocket.sendBIN(frame, got)) {
+        ++micSendFailures;
+      }
     }
   }
 }
 
+void printAudioDiagnostics() {
+  static uint32_t last = 0;
+  if (millis() - last < 1000) return;
+  last = millis();
+  AudioStats s;
+  portENTER_CRITICAL(&statsMux);
+  s = audioStats;
+  portEXIT_CRITICAL(&statsMux);
+  Serial.printf("[MIC] rms=%.0f peak=%.0f dc=%.0f gain=%.2f "
+                "slot0=%.0f slot1=%.0f samples=%lu clip=%lu readErr=%lu "
+                "drop=%lu sendFail=%lu muted=%d ready=%d queue=%u "
+                "spkDrop=%lu spkErr=%lu\n",
+                s.rms, s.peak, s.dc, s.gain, s.slot0, s.slot1,
+                (unsigned long)s.samples, (unsigned long)s.clipped,
+                (unsigned long)s.readErrors, (unsigned long)micDroppedBytes,
+                (unsigned long)micSendFailures, micMuted(), serverReady,
+                (unsigned)xStreamBufferBytesAvailable(micStream),
+                (unsigned long)spkOverflowBytes, (unsigned long)spkWriteErrors);
+}
+
+void fatalError(const char* message) {
+  Serial.println(message);
+  while (true) delay(1000);
+}
+
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(1000);
+  Serial.println("\n--- Starting ESP32 Setup ---");
 
-  // تهيئة الشاشة على المنافذ البديلة (SDA = GPIO 18, SCL = GPIO 19)
   Wire.begin(18, 19); 
   if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     Serial.println(F("SSD1306 allocation failed"));
   } else {
+    oledReady = true;
     display.clearDisplay();
     drawFace(STATE_CONNECTING);
+    Serial.println("OLED initialized.");
   }
 
   micStream = xStreamBufferCreate(MIC_BUFFER_BYTES, 1);
   spkStream = xStreamBufferCreate(SPK_BUFFER_BYTES, 1);
 
-  initMicrophone();
-  initSpeaker();
+  if (!micStream || !spkStream) fatalError("Audio buffer allocation failed");
+  if (!initMicrophone()) fatalError("Microphone I2S init failed");
+  if (!initSpeaker()) fatalError("Speaker I2S init failed");
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
+  
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 25) {
+    delay(500);
+    attempts++;
+  }
 
   webSocket.begin(SERVER_HOST, SERVER_PORT, SERVER_PATH, "");
   webSocket.onEvent(onWebSocketEvent);
   webSocket.setReconnectInterval(WS_RECONNECT_MS);
 
-  xTaskCreatePinnedToCore(micTask, "mic", 4096, nullptr, 5, nullptr, 1);
-  xTaskCreatePinnedToCore(playbackTask, "playback", 4096, nullptr, 6, nullptr, 1);
+  if (xTaskCreatePinnedToCore(micTask, "mic", 6144, nullptr, 5, nullptr, 1) != pdPASS)
+    fatalError("Mic task allocation failed");
+  if (xTaskCreatePinnedToCore(playbackTask, "playback", 4096, nullptr, 6, nullptr, 1) !=pdPASS)
+    fatalError("Playback task allocation failed");
 }
 
 void loop() {
   maintainWiFi();
   webSocket.loop();
   pumpMicrophone();
+  printAudioDiagnostics();
 
-  // تحديث حالة الوجه والتفاعل مع حركة الصوت
   if (serverReady) {
     if (speakerActive) {
       currentState = STATE_SPEAKING;
     } else if (!micMuted()) {
       currentState = STATE_LISTENING;
     } else {
-      currentState = STATE_IDLE;
+      currentState = STATE_IDLE; // تم تصحيح الخطأ هنا بنجاح
     }
   } else {
     currentState = STATE_CONNECTING;
